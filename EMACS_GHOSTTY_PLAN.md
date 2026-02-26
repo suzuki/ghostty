@@ -589,8 +589,9 @@ static void refresh_line(emacs_env *env, EmacsGhosttyTerm *egt,
     text_buf[text_len] = '\0';
 
     // バッファの該当行を置換
-    // (goto-line y+1) → (delete-region (line-beginning) (line-end)) → (insert text)
-    // テキストプロパティで face を設定
+    // (goto-char (pos-bol y+1)) → (delete-region (pos-bol) (pos-eol)) → (insert text)
+    // Emacs 29+: pos-bol/pos-eol を使用 (line-beginning-position/line-end-position の後継)
+    // テキストプロパティ (font-lock-face) で色・属性を設定
     // ...
 }
 
@@ -760,21 +761,30 @@ Requires Emacs 30 or later."
   (unless (>= emacs-major-version 30)
     (user-error "ghostty-term requires Emacs 30 or later"))
   (let ((buf (generate-new-buffer "*ghostty-term*")))
-    (with-current-buffer buf
-      (ghostty-term-mode)
-      (pcase-let ((`(,cols . ,rows) (ghostty-term--window-size)))
-        (setq ghostty-term--term
-              (ghostty-term--new cols rows ghostty-term-max-scrollback))
-        (setq ghostty-term--process
-              (make-process
-               :name "ghostty-term"
-               :buffer buf
-               :command `("/bin/sh" "-c"
-                         ,(format "stty sane erase ^? rows %d columns %d && exec %s"
-                                  rows cols ghostty-term-shell))
-               :connection-type 'pty
-               :filter #'ghostty-term--filter
-               :sentinel #'ghostty-term--sentinel))))
+    ;; handler-bind (Emacs 30): スタック巻き戻しなしでエラー捕捉
+    ;; → モジュール初期化失敗時にバッファを確実にクリーンアップ
+    (handler-bind
+        ((error (lambda (err)
+                  (when (buffer-live-p buf) (kill-buffer buf))
+                  (signal (car err) (cdr err)))))
+      (with-current-buffer buf
+        (ghostty-term-mode)
+        (pcase-let ((`(,cols . ,rows) (ghostty-term--window-size)))
+          (setq ghostty-term--term
+                (ghostty-term--new cols rows ghostty-term-max-scrollback))
+          ;; with-environment-variables (Emacs 28): TERM 環境変数を設定
+          (with-environment-variables (("TERM" "xterm-256color")
+                                       ("COLORTERM" "truecolor"))
+            (setq ghostty-term--process
+                  (make-process
+                   :name "ghostty-term"
+                   :buffer buf
+                   :command `("/bin/sh" "-c"
+                             ,(format "stty sane erase ^? rows %d columns %d && exec %s"
+                                      rows cols ghostty-term-shell))
+                   :connection-type 'pty
+                   :filter #'ghostty-term--filter
+                   :sentinel #'ghostty-term--sentinel))))))
     (pop-to-buffer buf)))
 
 ;; ============================================================
@@ -1071,22 +1081,41 @@ Each function receives the buffer and event string.")
 
 Emacs 30 を最小バージョンとすることで、以下の新機能を積極的に使用する。
 
-**Emacs 28:**
-- native compilation (`native-comp`) — モジュールのロードと Elisp 側の高速化
-- `make_unibyte_string` (module API) — バイナリデータの直接渡し
-- `open_channel` (module API) — バックグラウンドスレッドからの非同期書き込み
+**Emacs 28 (利用可能):**
 
-**Emacs 29:**
-- `keymap-set` / `keymap-unset` — `define-key` を置き換え
-- `defvar-keymap` — キーマップ定義の簡潔化
-- `use-package` 組み込み — パッケージ設定の標準化
-- `setopt` — `defcustom` 変数の型安全な設定
-- `pos-bol` / `pos-eol` — `line-beginning-position` / `line-end-position` の置き換え
-- `with-restriction` — ナローイングの安全なスコープ管理
-- `string-search` — 文字列検索の簡潔化
+| 機能 | 本プランでの用途 |
+|------|-----------------|
+| native compilation (`native-comp`) | Elisp 側の高速化 (Emacs 30 ではデフォルト有効) |
+| `make_unibyte_string` (module API) | バイナリデータ (VT バイト列) の直接渡し |
+| `open_channel` (module API) | バックグラウンドスレッドからの非同期書き込み |
+| `named-let` | 末尾再帰ループ (描画ループ等) |
+| `with-environment-variables` | シェル起動時の環境変数設定 |
+| `file-name-concat` | パス結合 (設定ファイルパス構築) |
+| `string-pad`, `string-lines` | 行テキスト処理 |
+| `repeat-mode` サポート | キーマップの `:repeat` 対応 |
 
-**Emacs 30:**
-- `cl-generic` の改善、`pcase` パターンの拡張
-- `use-package` の `:vc` キーワード — Git からの直接インストール
-- `completion-metadata` の改善 — 補完システム連携
-- `buffer-match-p` の拡張 — バッファマッチング条件の柔軟化
+**Emacs 29 (利用可能):**
+
+| 機能 | 本プランでの用途 |
+|------|-----------------|
+| `keymap-set` / `keymap-unset` | `define-key` を完全に置き換え |
+| `defvar-keymap` | キーマップ定義の簡潔化 (`:parent`, `:repeat`) |
+| `use-package` 組み込み | パッケージ設定例の標準化 |
+| `setopt` | `defcustom` 変数の型安全な設定 |
+| `pos-bol` / `pos-eol` | `line-beginning-position` / `line-end-position` 置き換え |
+| `with-restriction` / `without-restriction` | ラベル付きナローイング (描画時のバッファ操作安全化) |
+| `while-let` | nil になるまでループ (セル走査等) |
+| `buffer-match-p` | ターミナルバッファの判定 |
+| `string-equal-ignore-case` | 大文字小文字無視の文字列比較 |
+
+**Emacs 30 (最小バージョン — 積極活用):**
+
+| 機能 | 本プランでの用途 |
+|------|-----------------|
+| `handler-bind` | スタック巻き戻しなしのエラーハンドリング — モジュール呼出失敗時のデバッグ容易化 |
+| `cond*` | `cond`/`pcase` の拡張 — キーイベント分岐等の複雑な条件分岐に |
+| `use-package` の `:vc` キーワード | Git リポジトリからの直接インストール例を提供 |
+| native compilation デフォルト有効 | `libgccjit` 存在時に自動で native-comp、パフォーマンス保証 |
+| 組み込み JSON パーサ (libjansson 不要) | 設定ファイル読込等の将来用途 |
+| `%b`/`%B` format 指定子 | デバッグ時のバイナリ表示 |
+| `buffer-match-p` 拡張 | 複合条件でのバッファマッチング |
