@@ -10,7 +10,7 @@ Emacs dynamic module として emacs-libvterm 相当の機能を実現する。
 ```
 ┌──────────────────────────────────────────────┐
 │  Emacs (Elisp)                               │
-│  ghostty-vterm.el                            │
+│  ghostty-term.el                            │
 │  - make-process (:connection-type 'pty)      │
 │  - process filter → C module へバイト列転送  │
 │  - timer-coalesced redraw (10ms)             │
@@ -19,7 +19,7 @@ Emacs dynamic module として emacs-libvterm 相当の機能を実現する。
                    │ Emacs Dynamic Module API
                    │ (emacs-module.h)
 ┌──────────────────▼───────────────────────────┐
-│  ghostty-vterm-module.c                      │
+│  ghostty-term-module.c                      │
 │  - emacs_module_init() エントリポイント      │
 │  - Emacs funcall でバッファ操作              │
 │  - user_ptr で GhosttyTerm* を保持           │
@@ -410,7 +410,7 @@ b.installArtifact(bridge);
 
 ---
 
-### 2.2 Layer 2: Emacs C モジュール (`ghostty-vterm-module.c`)
+### 2.2 Layer 2: Emacs C モジュール (`ghostty-term-module.c`)
 
 Emacs dynamic module API を使い、Zig ブリッジを Emacs から操作する。
 
@@ -418,9 +418,9 @@ Emacs dynamic module API を使い、Zig ブリッジを Emacs から操作す�
 
 ```
 emacs-ghostty/
-├── ghostty-vterm-module.c    # Emacs dynamic module (C)
-├── ghostty-vterm-module.h    # 共有型定義
-├── ghostty-vterm.el          # Elisp フロントエンド
+├── ghostty-term-module.c    # Emacs dynamic module (C)
+├── ghostty-term-module.h    # 共有型定義
+├── ghostty-term.el          # Elisp フロントエンド
 ├── ghostty_vt_bridge.h       # Zig ブリッジのヘッダ
 └── build.zig                 # ビルドスクリプト
     (or CMakeLists.txt/Makefile)
@@ -429,7 +429,7 @@ emacs-ghostty/
 #### 2.2.2 C モジュール主要関数
 
 ```c
-// ghostty-vterm-module.c
+// ghostty-term-module.c
 #include <emacs-module.h>
 #include "ghostty_vt_bridge.h"
 
@@ -456,10 +456,10 @@ static void term_finalizer(void *ptr) {
 }
 
 // ============================================================
-// Emacs 関数: ghostty-vterm--new
+// Emacs 関数: ghostty-term--new
 // ============================================================
 static emacs_value
-Fghostty_vterm_new(emacs_env *env, ptrdiff_t nargs,
+Fghostty_term_new(emacs_env *env, ptrdiff_t nargs,
                    emacs_value args[], void *data)
 {
     int cols = env->extract_integer(env, args[0]);
@@ -481,10 +481,10 @@ Fghostty_vterm_new(emacs_env *env, ptrdiff_t nargs,
 }
 
 // ============================================================
-// Emacs 関数: ghostty-vterm--write-input
+// Emacs 関数: ghostty-term--write-input
 // ============================================================
 static emacs_value
-Fghostty_vterm_write_input(emacs_env *env, ptrdiff_t nargs,
+Fghostty_term_write_input(emacs_env *env, ptrdiff_t nargs,
                            emacs_value args[], void *data)
 {
     EmacsGhosttyTerm *egt = env->get_user_ptr(env, args[0]);
@@ -500,11 +500,11 @@ Fghostty_vterm_write_input(emacs_env *env, ptrdiff_t nargs,
 }
 
 // ============================================================
-// Emacs 関数: ghostty-vterm--redraw
+// Emacs 関数: ghostty-term--redraw
 // (ダーティ行のみバッファを更新)
 // ============================================================
 static emacs_value
-Fghostty_vterm_redraw(emacs_env *env, ptrdiff_t nargs,
+Fghostty_term_redraw(emacs_env *env, ptrdiff_t nargs,
                       emacs_value args[], void *data)
 {
     EmacsGhosttyTerm *egt = env->get_user_ptr(env, args[0]);
@@ -523,7 +523,7 @@ Fghostty_vterm_redraw(emacs_env *env, ptrdiff_t nargs,
     uint16_t start = dirty.screen_cleared ? 0 : dirty.dirty_row_start;
     uint16_t end   = dirty.screen_cleared ? rows : dirty.dirty_row_end;
 
-    // Elisp: (ghostty-vterm--refresh-lines term start end)
+    // Elisp: (ghostty-term--refresh-lines term start end)
     // 各行のセルを読み取り、テキストプロパティ付きでバッファに挿入
     for (uint16_t y = start; y < end; y++) {
         refresh_line(env, egt, y, cols);
@@ -545,7 +545,7 @@ Fghostty_vterm_redraw(emacs_env *env, ptrdiff_t nargs,
         if (title) {
             emacs_value title_val = env->make_string(env, title, strlen(title));
             emacs_value cb_args[] = { title_val };
-            env->funcall(env, env->intern(env, "ghostty-vterm--set-title"),
+            env->funcall(env, env->intern(env, "ghostty-term--set-title"),
                         1, cb_args);
         }
     }
@@ -601,22 +601,22 @@ int emacs_module_init(struct emacs_runtime *ert) {
         bind_function(env, lsym, \
             env->make_function(env, min, max, csym, doc, NULL))
 
-    DEFUN("ghostty-vterm--new",         Fghostty_vterm_new,         2, 3,
+    DEFUN("ghostty-term--new",         Fghostty_term_new,         2, 3,
           "Create a new ghostty terminal (COLS ROWS &optional SCROLLBACK).");
-    DEFUN("ghostty-vterm--write-input", Fghostty_vterm_write_input, 2, 2,
+    DEFUN("ghostty-term--write-input", Fghostty_term_write_input, 2, 2,
           "Write input bytes to terminal.");
-    DEFUN("ghostty-vterm--redraw",      Fghostty_vterm_redraw,      1, 1,
+    DEFUN("ghostty-term--redraw",      Fghostty_term_redraw,      1, 1,
           "Redraw dirty lines into Emacs buffer.");
-    DEFUN("ghostty-vterm--resize",      Fghostty_vterm_resize,      3, 3,
+    DEFUN("ghostty-term--resize",      Fghostty_term_resize,      3, 3,
           "Resize terminal (TERM COLS ROWS).");
-    DEFUN("ghostty-vterm--get-cursor",  Fghostty_vterm_get_cursor,  1, 1,
+    DEFUN("ghostty-term--get-cursor",  Fghostty_term_get_cursor,  1, 1,
           "Get cursor position as (X . Y).");
     // ... 他の関数も同様
 
     #undef DEFUN
 
     env->funcall(env, env->intern(env, "provide"),
-                 1, (emacs_value[]){ env->intern(env, "ghostty-vterm-module") });
+                 1, (emacs_value[]){ env->intern(env, "ghostty-term-module") });
     return 0;
 }
 ```
@@ -626,8 +626,8 @@ int emacs_module_init(struct emacs_runtime *ert) {
 emacs-libvterm と同じ方式を採用:
 
 1. **Emacs が PTY を所有**: `make-process` で `:connection-type 'pty` 指定
-2. **プロセスフィルタ**で PTY 出力を受信 → `ghostty-vterm--write-input` で Zig ブリッジへ転送
-3. **タイマー合体描画**: 10ms タイマーで `ghostty-vterm--redraw` を呼ぶ
+2. **プロセスフィルタ**で PTY 出力を受信 → `ghostty-term--write-input` で Zig ブリッジへ転送
+3. **タイマー合体描画**: 10ms タイマーで `ghostty-term--redraw` を呼ぶ
    - 即座のインタラクティブ応答が必要な場合はタイマーをバイパス
 4. **差分描画**: `ghostty_vt_get_dirty()` でダーティ行のみ更新
 5. **テキストプロパティ**: `font-lock-face` で色・属性を表現
@@ -635,12 +635,12 @@ emacs-libvterm と同じ方式を採用:
 ```
 PTY 出力
   → Emacs event loop (select/poll)
-  → ghostty-vterm--filter (Elisp)
-    → ghostty-vterm--write-input (C module → Zig bridge)
+  → ghostty-term--filter (Elisp)
+    → ghostty-term--write-input (C module → Zig bridge)
       → Terminal.vtStream().process()
       → ダーティフラグ更新
   → タイマー発火 (10ms)
-    → ghostty-vterm--redraw (C module)
+    → ghostty-term--redraw (C module)
       → ghostty_vt_get_dirty() でダーティ行特定
       → ghostty_vt_get_row_cells() でセル読取
       → Emacs バッファに insert + text-property 設定
@@ -648,127 +648,127 @@ PTY 出力
 
 ---
 
-### 2.3 Layer 3: Elisp フロントエンド (`ghostty-vterm.el`)
+### 2.3 Layer 3: Elisp フロントエンド (`ghostty-term.el`)
 
 #### 2.3.1 主要コンポーネント
 
 ```elisp
-;;; ghostty-vterm.el --- Terminal emulator powered by libghostty -*- lexical-binding: t -*-
+;;; ghostty-term.el --- Terminal emulator powered by libghostty -*- lexical-binding: t -*-
 
-(require 'ghostty-vterm-module)
+(require 'ghostty-term-module)
 
 ;; ============================================================
 ;; カスタマイズ変数
 ;; ============================================================
-(defgroup ghostty-vterm nil
+(defgroup ghostty-term nil
   "Terminal emulator powered by libghostty."
   :group 'terminals)
 
-(defcustom ghostty-vterm-shell shell-file-name
+(defcustom ghostty-term-shell shell-file-name
   "Shell to run in the terminal."
   :type 'string)
 
-(defcustom ghostty-vterm-max-scrollback 10000
+(defcustom ghostty-term-max-scrollback 10000
   "Maximum scrollback lines."
   :type 'integer)
 
-(defcustom ghostty-vterm-timer-delay 0.01
+(defcustom ghostty-term-timer-delay 0.01
   "Delay for coalescing redraws (seconds)."
   :type 'float)
 
 ;; ============================================================
 ;; メジャーモード
 ;; ============================================================
-(define-derived-mode ghostty-vterm-mode fundamental-mode "GhosttyVTerm"
+(define-derived-mode ghostty-term-mode fundamental-mode "GhosttyTerm"
   "Major mode for Ghostty terminal emulator."
-  :group 'ghostty-vterm
+  :group 'ghostty-term
   (setq-local buffer-read-only t)
-  (setq-local ghostty-vterm--term nil)
-  (setq-local ghostty-vterm--process nil)
-  (setq-local ghostty-vterm--redraw-timer nil))
+  (setq-local ghostty-term--term nil)
+  (setq-local ghostty-term--process nil)
+  (setq-local ghostty-term--redraw-timer nil))
 
 ;; ============================================================
 ;; エントリポイント
 ;; ============================================================
-(defun ghostty-vterm ()
+(defun ghostty-term ()
   "Create a new Ghostty terminal buffer."
   (interactive)
-  (let ((buf (generate-new-buffer "*ghostty-vterm*")))
+  (let ((buf (generate-new-buffer "*ghostty-term*")))
     (with-current-buffer buf
-      (ghostty-vterm-mode)
-      (let* ((size (ghostty-vterm--window-size))
+      (ghostty-term-mode)
+      (let* ((size (ghostty-term--window-size))
              (cols (car size))
              (rows (cdr size)))
-        (setq ghostty-vterm--term
-              (ghostty-vterm--new cols rows ghostty-vterm-max-scrollback))
-        (setq ghostty-vterm--process
+        (setq ghostty-term--term
+              (ghostty-term--new cols rows ghostty-term-max-scrollback))
+        (setq ghostty-term--process
               (make-process
-               :name "ghostty-vterm"
+               :name "ghostty-term"
                :buffer buf
                :command `("/bin/sh" "-c"
                          ,(format "stty sane erase ^? rows %d columns %d && exec %s"
-                                  rows cols ghostty-vterm-shell))
+                                  rows cols ghostty-term-shell))
                :connection-type 'pty
-               :filter #'ghostty-vterm--filter
-               :sentinel #'ghostty-vterm--sentinel))))
+               :filter #'ghostty-term--filter
+               :sentinel #'ghostty-term--sentinel))))
     (switch-to-buffer buf)))
 
 ;; ============================================================
 ;; プロセスフィルタ (PTY → ターミナル)
 ;; ============================================================
-(defun ghostty-vterm--filter (process output)
+(defun ghostty-term--filter (process output)
   "Process filter: feed PTY output to ghostty terminal."
   (when (buffer-live-p (process-buffer process))
     (with-current-buffer (process-buffer process)
-      (ghostty-vterm--write-input ghostty-vterm--term output)
-      (ghostty-vterm--schedule-redraw))))
+      (ghostty-term--write-input ghostty-term--term output)
+      (ghostty-term--schedule-redraw))))
 
 ;; ============================================================
 ;; タイマー合体描画
 ;; ============================================================
-(defun ghostty-vterm--schedule-redraw ()
+(defun ghostty-term--schedule-redraw ()
   "Schedule a coalesced redraw."
-  (unless ghostty-vterm--redraw-timer
-    (setq ghostty-vterm--redraw-timer
-          (run-with-timer ghostty-vterm-timer-delay nil
-                          #'ghostty-vterm--do-redraw
+  (unless ghostty-term--redraw-timer
+    (setq ghostty-term--redraw-timer
+          (run-with-timer ghostty-term-timer-delay nil
+                          #'ghostty-term--do-redraw
                           (current-buffer)))))
 
-(defun ghostty-vterm--do-redraw (buf)
+(defun ghostty-term--do-redraw (buf)
   "Perform the actual redraw."
   (when (buffer-live-p buf)
     (with-current-buffer buf
-      (setq ghostty-vterm--redraw-timer nil)
+      (setq ghostty-term--redraw-timer nil)
       (let ((inhibit-read-only t))
-        (ghostty-vterm--redraw ghostty-vterm--term)))))
+        (ghostty-term--redraw ghostty-term--term)))))
 
 ;; ============================================================
 ;; キー入力
 ;; ============================================================
-(defun ghostty-vterm--self-insert ()
+(defun ghostty-term--self-insert ()
   "Send the current key event to the terminal."
   (interactive)
   (let* ((keys (this-command-keys-vector))
-         (encoded (ghostty-vterm--encode-key keys)))
+         (encoded (ghostty-term--encode-key keys)))
     (when encoded
-      (process-send-string ghostty-vterm--process encoded))))
+      (process-send-string ghostty-term--process encoded))))
 
 ;; ============================================================
 ;; リサイズ
 ;; ============================================================
-(defun ghostty-vterm--window-size-change (_frame)
+(defun ghostty-term--window-size-change (_frame)
   "Handle window resize."
   (dolist (win (window-list))
     (with-current-buffer (window-buffer win)
-      (when (derived-mode-p 'ghostty-vterm-mode)
-        (let* ((size (ghostty-vterm--window-size))
+      (when (derived-mode-p 'ghostty-term-mode)
+        (let* ((size (ghostty-term--window-size))
                (cols (car size))
                (rows (cdr size)))
-          (ghostty-vterm--resize ghostty-vterm--term cols rows)
-          (set-process-window-size ghostty-vterm--process rows cols)
-          (ghostty-vterm--schedule-redraw))))))
+          (ghostty-term--resize ghostty-term--term cols rows)
+          (set-process-window-size ghostty-term--process rows cols)
+          (ghostty-term--schedule-redraw))))))
 
-(add-hook 'window-size-change-functions #'ghostty-vterm--window-size-change)
+(add-hook 'window-size-change-functions #'ghostty-term--window-size-change)
 ```
 
 ---
@@ -877,7 +877,7 @@ PTY 出力
 
 ## 5. emacs-libvterm との機能対応表
 
-| emacs-libvterm 機能 | ghostty-vterm 対応方針 |
+| emacs-libvterm 機能 | ghostty-term 対応方針 |
 |---------------------|----------------------|
 | libvterm の VTerm/VTermScreen | Terminal.zig + Screen.zig |
 | vterm_input_write() | Terminal.vtStream().process() |
