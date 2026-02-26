@@ -462,9 +462,9 @@ static emacs_value
 Fghostty_term_new(emacs_env *env, ptrdiff_t nargs,
                    emacs_value args[], void *data)
 {
-    int cols = env->extract_integer(env, args[0]);
-    int rows = env->extract_integer(env, args[1]);
-    int scrollback = (nargs > 2)
+    intmax_t cols = env->extract_integer(env, args[0]);
+    intmax_t rows = env->extract_integer(env, args[1]);
+    intmax_t scrollback = (nargs > 2)
         ? env->extract_integer(env, args[2])
         : 10000;
 
@@ -527,7 +527,7 @@ Fghostty_term_redraw(emacs_env *env, ptrdiff_t nargs,
     // 各行のセルを読み取り、テキストプロパティ付きでバッファに挿入
     for (uint16_t y = start; y < end; y++) {
         refresh_line(env, egt, y, cols);
-        if (env->should_quit(env) != emacs_funcall_exit_return)
+        if (env->should_quit(env))
             break;
     }
 
@@ -593,30 +593,47 @@ static void refresh_line(emacs_env *env, EmacsGhosttyTerm *egt,
 // ============================================================
 // モジュール初期化
 // ============================================================
+/* Helper: bind a C function to a Lisp symbol via defalias */
+static void bind_function(emacs_env *env, const char *name, emacs_value Sfun) {
+    emacs_value Qdefalias = env->intern(env, "defalias");
+    emacs_value Qsym = env->intern(env, name);
+    emacs_value args[] = { Qsym, Sfun };
+    env->funcall(env, Qdefalias, 2, args);
+}
+
+/* Helper: provide a feature */
+static void provide(emacs_env *env, const char *feature) {
+    emacs_value Qfeat = env->intern(env, feature);
+    emacs_value Qprovide = env->intern(env, "provide");
+    emacs_value args[] = { Qfeat };
+    env->funcall(env, Qprovide, 1, args);
+}
+
 int emacs_module_init(struct emacs_runtime *ert) {
     if (ert->size < sizeof(*ert)) return 1;
     emacs_env *env = ert->get_environment(ert);
+    if (env->size < sizeof(*env)) return 2;
 
-    #define DEFUN(lsym, csym, min, max, doc) \
+    #define DEFUN(lsym, csym, min, max, doc, data) \
         bind_function(env, lsym, \
-            env->make_function(env, min, max, csym, doc, NULL))
+            env->make_function(env, min, max, csym, doc, data))
 
     DEFUN("ghostty-term--new",         Fghostty_term_new,         2, 3,
-          "Create a new ghostty terminal (COLS ROWS &optional SCROLLBACK).");
+          "Create a new ghostty terminal (COLS ROWS &optional SCROLLBACK).",
+          NULL);
     DEFUN("ghostty-term--write-input", Fghostty_term_write_input, 2, 2,
-          "Write input bytes to terminal.");
+          "Write input bytes to terminal.", NULL);
     DEFUN("ghostty-term--redraw",      Fghostty_term_redraw,      1, 1,
-          "Redraw dirty lines into Emacs buffer.");
+          "Redraw dirty lines into Emacs buffer.", NULL);
     DEFUN("ghostty-term--resize",      Fghostty_term_resize,      3, 3,
-          "Resize terminal (TERM COLS ROWS).");
+          "Resize terminal (TERM COLS ROWS).", NULL);
     DEFUN("ghostty-term--get-cursor",  Fghostty_term_get_cursor,  1, 1,
-          "Get cursor position as (X . Y).");
+          "Get cursor position as (X . Y).", NULL);
     // ... 他の関数も同様
 
     #undef DEFUN
 
-    env->funcall(env, env->intern(env, "provide"),
-                 1, (emacs_value[]){ env->intern(env, "ghostty-term-module") });
+    provide(env, "ghostty-term-module");
     return 0;
 }
 ```
@@ -910,3 +927,51 @@ PTY 出力
 | スクロールバック効率 | リングバッファ | mmap ページリスト |
 | メモリ効率 | 良好 | 優秀 (64-bit packed cell) |
 | 開発の活発さ | 低頻度更新 | 活発 |
+
+---
+
+## 7. Emacs ソースコード検証結果
+
+`emacs-mirror/emacs` の最新 HEAD (2026-02-26 時点) に対して
+`src/emacs-module.h.in` + `src/module-env-{25..31}.h` +
+`test/src/emacs-module-resources/mod-test.c` を精査し、
+プランで使用する全 API の存在と署名を確認した。
+
+### 7.1 最小 Emacs バージョン要件
+
+| API | 導入バージョン | 本プランでの用途 | 必須? |
+|-----|---------------|-----------------|-------|
+| `intern`, `funcall`, `make_function` | Emacs 25 | 関数登録・呼出 | 必須 |
+| `make_user_ptr`, `get_user_ptr` | Emacs 25 | ターミナル状態保持 | 必須 |
+| `make_string`, `copy_string_contents` | Emacs 25 | 文字列操作 | 必須 |
+| `extract_integer`, `make_integer` | Emacs 25 | 数値受渡 | 必須 |
+| `non_local_exit_signal` | Emacs 25 | エラー報告 | 必須 |
+| `should_quit` | Emacs 26 | C-g 検出 | 必須 |
+| `process_input` | Emacs 27 | 描画ループ中の入力処理 | 必須 |
+| `extract_time`, `make_time` | Emacs 27 | (将来用) | 任意 |
+| `open_channel` | Emacs 28 | 非同期パイプ I/O | 任意 |
+| `make_interactive` | Emacs 28 | (将来用) | 任意 |
+| `make_unibyte_string` | Emacs 28 | バイナリ文字列 | 任意 |
+| (Emacs 29-31) | — | 新規 API なし | — |
+
+**結論: 最小要求バージョンは Emacs 27**
+(`process_input` を描画ループで使用するため)
+
+### 7.2 検証で修正した問題
+
+| # | 問題 | 修正内容 |
+|---|------|---------|
+| 1 | `should_quit` の戻り値型 | `!= emacs_funcall_exit_return` → `bool` 直接評価 |
+| 2 | `extract_integer` の戻り値型 | `int` → `intmax_t` |
+| 3 | `bind_function` の実装 | Emacs 公式テストに合わせ `defalias` を使用 |
+| 4 | DEFUN マクロに `data` 引数がなかった | `data` パラメータ追加 |
+| 5 | `env->size` チェックが欠落 | `emacs_module_init` に追加 |
+| 6 | `provide` ヘルパー関数がなかった | `bind_function` と共にヘルパーとして追加 |
+
+### 7.3 Emacs 29-31 で追加された API
+
+- **Emacs 29**: env snippet は空 (新規 API なし)
+- **Emacs 30**: env snippet は空 (新規 API なし)
+- **Emacs 31**: プレースホルダーのみ (リリース前)
+
+Emacs 27 以降で API は安定しており、本プランの設計に影響する変更はない。
