@@ -3,6 +3,10 @@
 libghostty-vt の Zig 内部 API 上に Zig→C ブリッジを構築し、
 Emacs dynamic module として emacs-libvterm 相当の機能を実現する。
 
+**最小要求バージョン: Emacs 30**
+— 新しい Elisp 機能・マクロ (`defvar-keymap`, `keymap-set`, `pcase-let`,
+`when-let*`, `pos-bol`/`pos-eol`, `use-package` 組み込み等) を積極的に活用する。
+
 ---
 
 ## 1. アーキテクチャ概要
@@ -672,6 +676,8 @@ PTY 出力
 ```elisp
 ;;; ghostty-term.el --- Terminal emulator powered by libghostty -*- lexical-binding: t -*-
 
+;; Requires: Emacs 30+
+
 (require 'ghostty-term-module)
 
 ;; ============================================================
@@ -687,35 +693,76 @@ PTY 出力
 
 (defcustom ghostty-term-max-scrollback 10000
   "Maximum scrollback lines."
-  :type 'integer)
+  :type 'natnum)
 
 (defcustom ghostty-term-timer-delay 0.01
   "Delay for coalescing redraws (seconds)."
   :type 'float)
 
+(defcustom ghostty-term-kill-buffer-on-exit t
+  "Kill the terminal buffer when the shell process exits."
+  :type 'boolean)
+
+;; ============================================================
+;; キーマップ (Emacs 29+: defvar-keymap)
+;; ============================================================
+(defvar-keymap ghostty-term-mode-map
+  :doc "Keymap for `ghostty-term-mode'."
+  :parent special-mode-map
+  ;; 全印字可能文字 + 制御キーをターミナルに転送
+  "RET"       #'ghostty-term--send-key
+  "TAB"       #'ghostty-term--send-key
+  "DEL"       #'ghostty-term--send-key
+  "SPC"       #'ghostty-term--send-key
+  "<up>"      #'ghostty-term--send-key
+  "<down>"    #'ghostty-term--send-key
+  "<left>"    #'ghostty-term--send-key
+  "<right>"   #'ghostty-term--send-key
+  "<home>"    #'ghostty-term--send-key
+  "<end>"     #'ghostty-term--send-key
+  "C-c C-c"   #'ghostty-term--send-ctrl-c
+  "C-c C-z"   #'ghostty-term--send-ctrl-z
+  "C-c C-\\"  #'ghostty-term--send-ctrl-backslash)
+
+;; 印字可能文字の一括バインド (Emacs 29+: keymap-set)
+(dotimes (i 95)
+  (keymap-set ghostty-term-mode-map
+              (string (+ i 32))
+              #'ghostty-term--self-insert))
+
 ;; ============================================================
 ;; メジャーモード
 ;; ============================================================
-(define-derived-mode ghostty-term-mode fundamental-mode "GhosttyTerm"
-  "Major mode for Ghostty terminal emulator."
+(define-derived-mode ghostty-term-mode special-mode "GhosttyTerm"
+  "Major mode for Ghostty terminal emulator.
+
+Requires Emacs 30 or later."
   :group 'ghostty-term
+  :interactive nil
   (setq-local buffer-read-only t)
   (setq-local ghostty-term--term nil)
   (setq-local ghostty-term--process nil)
-  (setq-local ghostty-term--redraw-timer nil))
+  (setq-local ghostty-term--redraw-timer nil)
+  (setq-local scroll-conservatively 101)
+  (setq-local cursor-type 'box)
+  (setq-local truncate-lines t)
+  ;; Emacs 29+: window-size-change-functions はバッファローカルにできる
+  (add-hook 'window-size-change-functions
+            #'ghostty-term--window-size-change nil t))
 
 ;; ============================================================
 ;; エントリポイント
 ;; ============================================================
+;;;###autoload
 (defun ghostty-term ()
   "Create a new Ghostty terminal buffer."
   (interactive)
+  (unless (>= emacs-major-version 30)
+    (user-error "ghostty-term requires Emacs 30 or later"))
   (let ((buf (generate-new-buffer "*ghostty-term*")))
     (with-current-buffer buf
       (ghostty-term-mode)
-      (let* ((size (ghostty-term--window-size))
-             (cols (car size))
-             (rows (cdr size)))
+      (pcase-let ((`(,cols . ,rows) (ghostty-term--window-size)))
         (setq ghostty-term--term
               (ghostty-term--new cols rows ghostty-term-max-scrollback))
         (setq ghostty-term--process
@@ -728,17 +775,38 @@ PTY 出力
                :connection-type 'pty
                :filter #'ghostty-term--filter
                :sentinel #'ghostty-term--sentinel))))
-    (switch-to-buffer buf)))
+    (pop-to-buffer buf)))
 
 ;; ============================================================
 ;; プロセスフィルタ (PTY → ターミナル)
 ;; ============================================================
 (defun ghostty-term--filter (process output)
   "Process filter: feed PTY output to ghostty terminal."
-  (when (buffer-live-p (process-buffer process))
-    (with-current-buffer (process-buffer process)
+  (when-let* ((buf (process-buffer process))
+              ((buffer-live-p buf)))
+    (with-current-buffer buf
       (ghostty-term--write-input ghostty-term--term output)
       (ghostty-term--schedule-redraw))))
+
+;; ============================================================
+;; プロセスセンチネル
+;; ============================================================
+(defun ghostty-term--sentinel (process event)
+  "Handle shell process state changes."
+  (when-let* ((buf (process-buffer process))
+              ((buffer-live-p buf)))
+    (with-current-buffer buf
+      (when ghostty-term--redraw-timer
+        (cancel-timer ghostty-term--redraw-timer)
+        (setq ghostty-term--redraw-timer nil))
+      (run-hook-with-args 'ghostty-term-exit-functions buf event)
+      (when (and ghostty-term-kill-buffer-on-exit
+                 (memq (process-status process) '(exit signal)))
+        (kill-buffer buf)))))
+
+(defvar ghostty-term-exit-functions nil
+  "Abnormal hook run when the terminal process exits.
+Each function receives the buffer and event string.")
 
 ;; ============================================================
 ;; タイマー合体描画
@@ -763,29 +831,58 @@ PTY 出力
 ;; キー入力
 ;; ============================================================
 (defun ghostty-term--self-insert ()
+  "Send the current key event to the terminal as a character."
+  (interactive)
+  (when-let* ((keys (this-command-keys-vector))
+              (encoded (ghostty-term--encode-key keys)))
+    (process-send-string ghostty-term--process encoded)))
+
+(defun ghostty-term--send-key ()
   "Send the current key event to the terminal."
   (interactive)
-  (let* ((keys (this-command-keys-vector))
-         (encoded (ghostty-term--encode-key keys)))
-    (when encoded
-      (process-send-string ghostty-term--process encoded))))
+  (when-let* ((keys (this-command-keys-vector))
+              (encoded (ghostty-term--encode-key keys)))
+    (process-send-string ghostty-term--process encoded)))
+
+(defun ghostty-term--send-ctrl-c ()
+  "Send C-c to the terminal."
+  (interactive)
+  (process-send-string ghostty-term--process "\C-c"))
+
+(defun ghostty-term--send-ctrl-z ()
+  "Send C-z to the terminal."
+  (interactive)
+  (process-send-string ghostty-term--process "\C-z"))
+
+(defun ghostty-term--send-ctrl-backslash ()
+  "Send C-\\ to the terminal."
+  (interactive)
+  (process-send-string ghostty-term--process "\C-\\"))
 
 ;; ============================================================
 ;; リサイズ
 ;; ============================================================
 (defun ghostty-term--window-size-change (_frame)
   "Handle window resize."
-  (dolist (win (window-list))
-    (with-current-buffer (window-buffer win)
-      (when (derived-mode-p 'ghostty-term-mode)
-        (let* ((size (ghostty-term--window-size))
-               (cols (car size))
-               (rows (cdr size)))
-          (ghostty-term--resize ghostty-term--term cols rows)
-          (set-process-window-size ghostty-term--process rows cols)
-          (ghostty-term--schedule-redraw))))))
+  ;; ghostty-term-mode のバッファローカルフックとして登録されるため、
+  ;; current-buffer は既に正しいバッファを指す
+  (when (and ghostty-term--term ghostty-term--process)
+    (pcase-let ((`(,cols . ,rows) (ghostty-term--window-size)))
+      (ghostty-term--resize ghostty-term--term cols rows)
+      (set-process-window-size ghostty-term--process rows cols)
+      (ghostty-term--schedule-redraw))))
 
-(add-hook 'window-size-change-functions #'ghostty-term--window-size-change)
+;; ============================================================
+;; use-package サポート (Emacs 29+ 組み込み)
+;; ============================================================
+;; (use-package ghostty-term
+;;   :commands ghostty-term
+;;   :custom
+;;   (ghostty-term-shell "/bin/zsh")
+;;   (ghostty-term-max-scrollback 20000))
+
+(provide 'ghostty-term)
+;;; ghostty-term.el ends here
 ```
 
 ---
@@ -939,23 +1036,25 @@ PTY 出力
 
 ### 7.1 最小 Emacs バージョン要件
 
-| API | 導入バージョン | 本プランでの用途 | 必須? |
-|-----|---------------|-----------------|-------|
-| `intern`, `funcall`, `make_function` | Emacs 25 | 関数登録・呼出 | 必須 |
-| `make_user_ptr`, `get_user_ptr` | Emacs 25 | ターミナル状態保持 | 必須 |
-| `make_string`, `copy_string_contents` | Emacs 25 | 文字列操作 | 必須 |
-| `extract_integer`, `make_integer` | Emacs 25 | 数値受渡 | 必須 |
-| `non_local_exit_signal` | Emacs 25 | エラー報告 | 必須 |
-| `should_quit` | Emacs 26 | C-g 検出 | 必須 |
-| `process_input` | Emacs 27 | 描画ループ中の入力処理 | 必須 |
-| `extract_time`, `make_time` | Emacs 27 | (将来用) | 任意 |
-| `open_channel` | Emacs 28 | 非同期パイプ I/O | 任意 |
-| `make_interactive` | Emacs 28 | (将来用) | 任意 |
-| `make_unibyte_string` | Emacs 28 | バイナリ文字列 | 任意 |
-| (Emacs 29-31) | — | 新規 API なし | — |
+**最小要求バージョン: Emacs 30**
 
-**結論: 最小要求バージョンは Emacs 27**
-(`process_input` を描画ループで使用するため)
+新しい Elisp 機能・マクロを積極的に活用する方針とし、
+レガシーバージョンの互換コードは書かない。
+
+| API | 導入バージョン | 本プランでの用途 | ステータス |
+|-----|---------------|-----------------|-----------|
+| `intern`, `funcall`, `make_function` | Emacs 25 | 関数登録・呼出 | 使用 |
+| `make_user_ptr`, `get_user_ptr` | Emacs 25 | ターミナル状態保持 | 使用 |
+| `make_string`, `copy_string_contents` | Emacs 25 | 文字列操作 | 使用 |
+| `extract_integer`, `make_integer` | Emacs 25 | 数値受渡 | 使用 |
+| `non_local_exit_signal` | Emacs 25 | エラー報告 | 使用 |
+| `should_quit` | Emacs 26 | C-g 検出 | 使用 |
+| `process_input` | Emacs 27 | 描画ループ中の入力処理 | 使用 |
+| `extract_time`, `make_time` | Emacs 27 | タイマー精度向上 | 使用 |
+| `open_channel` | Emacs 28 | 非同期パイプ I/O | 使用 |
+| `make_interactive` | Emacs 28 | インタラクティブ関数登録 | 使用 |
+| `make_unibyte_string` | Emacs 28 | バイナリ文字列処理 | 使用 |
+| (Emacs 29-30) | — | モジュール API 追加なし | — |
 
 ### 7.2 検証で修正した問題
 
@@ -968,10 +1067,26 @@ PTY 出力
 | 5 | `env->size` チェックが欠落 | `emacs_module_init` に追加 |
 | 6 | `provide` ヘルパー関数がなかった | `bind_function` と共にヘルパーとして追加 |
 
-### 7.3 Emacs 29-31 で追加された API
+### 7.3 Emacs 28-30 の Elisp 新機能の活用
 
-- **Emacs 29**: env snippet は空 (新規 API なし)
-- **Emacs 30**: env snippet は空 (新規 API なし)
-- **Emacs 31**: プレースホルダーのみ (リリース前)
+Emacs 30 を最小バージョンとすることで、以下の新機能を積極的に使用する。
 
-Emacs 27 以降で API は安定しており、本プランの設計に影響する変更はない。
+**Emacs 28:**
+- native compilation (`native-comp`) — モジュールのロードと Elisp 側の高速化
+- `make_unibyte_string` (module API) — バイナリデータの直接渡し
+- `open_channel` (module API) — バックグラウンドスレッドからの非同期書き込み
+
+**Emacs 29:**
+- `keymap-set` / `keymap-unset` — `define-key` を置き換え
+- `defvar-keymap` — キーマップ定義の簡潔化
+- `use-package` 組み込み — パッケージ設定の標準化
+- `setopt` — `defcustom` 変数の型安全な設定
+- `pos-bol` / `pos-eol` — `line-beginning-position` / `line-end-position` の置き換え
+- `with-restriction` — ナローイングの安全なスコープ管理
+- `string-search` — 文字列検索の簡潔化
+
+**Emacs 30:**
+- `cl-generic` の改善、`pcase` パターンの拡張
+- `use-package` の `:vc` キーワード — Git からの直接インストール
+- `completion-metadata` の改善 — 補完システム連携
+- `buffer-match-p` の拡張 — バッファマッチング条件の柔軟化
